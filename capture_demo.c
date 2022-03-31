@@ -44,7 +44,7 @@ unsigned short capture_get_port(const struct sk_buff *skb, int dir)
 			return 0;
 		}
 
-		if (dir == 0) {
+		if (dir == DST_PORT) {
 			port = ntohs(tcph->dest);
 			tcph = NULL;
 			return port;
@@ -59,7 +59,7 @@ unsigned short capture_get_port(const struct sk_buff *skb, int dir)
 			log_warn("udp header null \r\n");
 			return 0;
 		}
-		if (dir == 0) {
+		if (dir == DST_PORT) {
 			port = ntohs(udph->dest);
 			udph = NULL;
 			return port;
@@ -95,25 +95,26 @@ int capture_send(const struct sk_buff *skb, int output)
 	struct ethhdr *oldethh = NULL;
 	struct iphdr *oldiph = NULL;
 	struct iphdr *newiph = NULL;
+	struct udphdr *oldudph = NULL;
 	struct udphdr *newudph = NULL;
 	struct sk_buff *skb_cp = NULL;
-	struct net *net = NULL;
 	unsigned int headlen = 0;
 
-	headlen = 60;		// mac + ip + udp = 14 + 20 + 8 = 42, 这里分配大一点
+	// mac + ip + udp = 14 + 20 + 8 = 42, 这里分配大一点
+	headlen = 60;
 
 	//如果报文头部不够大，在复制的时候顺便扩展一下头部空间，够大的话直接复制
 	if (skb_headroom(skb) < headlen) {
 		skb_cp = skb_copy_expand(skb, headlen, 0, GFP_ATOMIC);
 		if (!skb_cp) {
 			log_warn(" realloc skb fail \r\n");
-			return -1;
+			return -ENOMEM;
 		}
 	} else {
 		skb_cp = skb_copy(skb, GFP_ATOMIC);
 		if (!skb_cp) {
 			log_warn(" copy skb fail \r\n");
-			return -1;
+			return -ENOMEM;
 		}
 	}
 
@@ -135,7 +136,7 @@ int capture_send(const struct sk_buff *skb, int output)
 	 */
 
 	//如果是出去的报文，因为是在IP层捕获，MAC层尚未填充，这里将MAC端置零，并填写协议字段
-	if (output) {
+	if (output == OUTPUT_SEND) {
 		skb_push(skb_cp, sizeof(struct ethhdr));
 		skb_reset_mac_header(skb_cp);
 		oldethh = eth_hdr(skb_cp);
@@ -163,19 +164,22 @@ int capture_send(const struct sk_buff *skb, int output)
 	if ((newiph == NULL) || (newudph == NULL)) {
 		log_warn("new ip udp header null \r\n");
 		kfree_skb(skb_cp);
-		return -1;
+		return -EINVAL;
 	}
 
-	/* 抓包的报文发送的时候是调用协议栈函数发送的，所以output钩子函数会捕获到抓包报文，
-	 * 这里我们要把抓包报文和正常报文区分开，区分方式就是判断源端口，我们抓到的报文
-	 *  在送出去的时候填写的是保留端口0，如果钩子函数遇到这样的报文就会直接let go
-	 * 防止重复抓包，这一点在测试的时候很重要，一旦重复抓包，系统就直接挂了...
+	/* 抓包的报文发送的时候是调用协议栈函数发送的，所以output钩子函数会捕获
+	 * 到抓包报文，
+	 * 这里我们要把抓包报文和正常报文区分开，区分方式就是判断源端口，我们抓
+	 * 到的报文在送出去的时候填写的是保留端口0，如果钩子函数遇到这样的报文
+	 * 就会直接let go 防止重复抓包，这一点在测试的时候很重要，一旦重复抓包，
+	 * 系统就直接挂了...
 	 */
 	memcpy((unsigned char *)newiph, (unsigned char *)oldiph,
 	       sizeof(struct iphdr));
+	memcpy((unsigned char *)newudph, (unsigned char *)oldudph,
+	       sizeof(struct iphdr));
 	newudph->source = htons(0);
 	newiph->saddr = in_aton("1.1.1.1");
-	newiph->saddr = in_aton("10.20.53.43");
 	newudph->dest = htons(58000);	//抓包服务器端口
 	newiph->daddr = in_aton("10.20.53.43");	//抓包服务器地址
 
@@ -192,7 +196,6 @@ int capture_send(const struct sk_buff *skb, int output)
 	//计算校验和
 	newudph->check = 0;
 	newiph->check = 0;
-	skb_cp->csum = 0;
 	skb_cp->csum =
 	    csum_partial(skb_transport_header(skb_cp), htons(newudph->len), 0);
 	newudph->check =
@@ -223,10 +226,11 @@ int capture_send(const struct sk_buff *skb, int output)
 #endif
 		kfree_skb(skb_cp);
 		log_info("ip route failed \r\n");
-		return -1;
+		return -EINVAL;
 	}
 	//发送
 	ip_local_out(&init_net, skb_cp->sk, skb_cp);
+
 	return 0;
 }
 
@@ -254,12 +258,18 @@ static unsigned int capture_input_hook(void *priv,
 	skb_set_transport_header(skb, (iph->ihl * 4));
 
 	//检查端口，端口为0的let go
-	sport = capture_get_port(skb, 1);
-	if (sport == 0)
+	sport = capture_get_port(skb, SRC_PORT);
+	if (sport == 0 || sport != 53)
 		return NF_ACCEPT;
 
+	printk(KERN_INFO "This is a DNS response!\n");
+
+#if 0
 	//复制一份报文并发送出去    
-	capture_send(skb, 0);
+	capture_send(skb, INPUT_SEND);
+#else
+	skb_dump(KERN_INFO, skb, false);
+#endif
 
 	//返回accept，让系统正常处理
 	return NF_ACCEPT;
@@ -282,7 +292,7 @@ static unsigned int capture_output_hook(void *priv,
 		return NF_ACCEPT;
 
 	//如果源端口为0，是抓包报文，直接let it go, 否则进行抓包
-	sport = capture_get_port(skb, 1);
+	sport = capture_get_port(skb, SRC_PORT);
 
 	if (output_dst == NULL) {
 		if (skb_dst(skb) != NULL) {
@@ -294,45 +304,34 @@ static unsigned int capture_output_hook(void *priv,
 	}
 
 	if (sport != 0)
-		capture_send(skb, 1);
+		capture_send(skb, OUTPUT_SEND);
 
 	return NF_ACCEPT;
 }
 
-#if 0
-struct nf_hook_ops capture_hook_ops[] = {
-	{
-	 .hook = capture_input_hook,	//输入钩子处理函数
-	 .pf = NFPROTO_IPV4,
-	 .hooknum = NF_INET_PRE_ROUTING,	//hook点
-	 .priority = NF_IP_PRI_FIRST + 10,	//优先级
-	  },
-	{
-	 .hook = capture_output_hook,	//输出钩子处理函数
-	 .pf = NFPROTO_IPV4,
-	 .hooknum = NF_INET_POST_ROUTING,	//hook点
-	 .priority = 0,		//优先级
-	  },
-	{ }
-};
-#else
 static struct nf_hook_ops capture_hook_ops[] = {
 	{
 	 .hook = capture_input_hook,	//输入钩子处理函数
-	 .hooknum = NF_INET_LOCAL_IN,
-	 .pf = PF_INET,
+	 /*协议簇为ipv4*/
+	 .pf = NFPROTO_INET,
+	 /*hook的类型为在完整性校验之后，选路确定之前*/
+	 .hooknum = NF_INET_PRE_ROUTING,
+	 /*优先级最高*/
 	 .priority = NF_IP_PRI_FIRST },
+#if 0
 	{
 	 .hook = capture_output_hook,	//输出钩子处理函数
-	 .hooknum = NF_INET_LOCAL_OUT,
+	 /*协议簇为ipv4*/
 	 .pf = PF_INET,
+	 /*hook的类型为在完数据包离开本地主机“上线”之前*/
+	 .hooknum = NF_INET_POST_ROUTING,
 	 .priority = NF_IP_PRI_FIRST },
-};
 #endif
+};
 
 static int __init capture_init(void)
 {
-	//注册钩子函数
+	//注册钩子函数, 注册实际上就是在一个nf_hook_ops链表中再插入一个nf_hook_ops结构*/
 	if (nf_register_net_hooks
 	    (&init_net, capture_hook_ops, ARRAY_SIZE(capture_hook_ops)) != 0) {
 		log_warn("netfilter register fail");
@@ -355,9 +354,9 @@ static void __exit capture_exit(void)
 	return;
 }
 
-module_init(capture_init)
-    module_exit(capture_exit)
-    MODULE_ALIAS("capture");
+module_init(capture_init);
+module_exit(capture_exit);
+MODULE_ALIAS("capture");
 MODULE_AUTHOR("fuyuande");
 MODULE_DESCRIPTION("capture module");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("GPL v2");

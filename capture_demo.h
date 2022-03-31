@@ -1,6 +1,15 @@
 #ifndef __CAPTURE_DEMO_H__
 #define __CAPTURE_DEMO_H__
 
+enum {
+	DST_PORT,
+	SRC_PORT,
+};
+
+enum {
+	INPUT_SEND,
+	OUTPUT_SEND,
+};
 
 #ifndef CAPTURE_ALL
 /* ip protocol */
