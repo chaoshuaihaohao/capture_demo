@@ -8,6 +8,7 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/init.h>
+#include <linux/skbuff.h>
 #include <linux/socket.h>
 #include <linux/netfilter.h>
 #include <linux/netfilter_ipv4.h>
@@ -21,6 +22,106 @@
 #include <linux/inet.h>
 
 #include "capture_demo.h"
+
+#if (LINUX_VERSION_CODE <= KERNEL_VERSION(5, 3, 0))
+/* Dump skb information and contents.
+ *
+ * Must only be called from net_ratelimit()-ed paths.
+ *
+ * Dumps up to can_dump_full whole packets if full_pkt, headers otherwise.
+ */
+void skb_dump(const char *level, const struct sk_buff *skb, bool full_pkt)
+{
+	static atomic_t can_dump_full = ATOMIC_INIT(5);
+	struct skb_shared_info *sh = skb_shinfo(skb);
+	struct net_device *dev = skb->dev;
+	struct sock *sk = skb->sk;
+	struct sk_buff *list_skb;
+	bool has_mac, has_trans;
+	int headroom, tailroom;
+	int i, len, seg_len;
+
+	if (full_pkt)
+		full_pkt = atomic_dec_if_positive(&can_dump_full) >= 0;
+
+	if (full_pkt)
+		len = skb->len;
+	else
+		len = min_t(int, skb->len, MAX_HEADER + 128);
+
+	headroom = skb_headroom(skb);
+	tailroom = skb_tailroom(skb);
+
+	has_mac = skb_mac_header_was_set(skb);
+	has_trans = skb_transport_header_was_set(skb);
+
+	printk("%sskb len=%u headroom=%u headlen=%u tailroom=%u\n"
+	       "mac=(%d,%d) net=(%d,%d) trans=%d\n"
+	       "shinfo(txflags=%u nr_frags=%u gso(size=%hu type=%u segs=%hu))\n"
+	       "csum(0x%x ip_summed=%u complete_sw=%u valid=%u level=%u)\n"
+	       "hash(0x%x sw=%u l4=%u) proto=0x%04x pkttype=%u iif=%d\n",
+	       level, skb->len, headroom, skb_headlen(skb), tailroom,
+	       has_mac ? skb->mac_header : -1,
+	       has_mac ? skb_mac_header_len(skb) : -1,
+	       skb->network_header,
+	       has_trans ? skb_network_header_len(skb) : -1,
+	       has_trans ? skb->transport_header : -1,
+	       sh->tx_flags, sh->nr_frags,
+	       sh->gso_size, sh->gso_type, sh->gso_segs,
+	       skb->csum, skb->ip_summed, skb->csum_complete_sw,
+	       skb->csum_valid, skb->csum_level,
+	       skb->hash, skb->sw_hash, skb->l4_hash,
+	       ntohs(skb->protocol), skb->pkt_type, skb->skb_iif);
+
+	if (dev)
+		printk("%sdev name=%s feat=0x%pNF\n",
+		       level, dev->name, &dev->features);
+	if (sk)
+		printk("%ssk family=%hu type=%hu proto=%hu\n",
+		       level, sk->sk_family, sk->sk_type, sk->sk_protocol);
+
+	if (full_pkt && headroom)
+		print_hex_dump(level, "skb headroom: ", DUMP_PREFIX_OFFSET,
+			       16, 1, skb->head, headroom, false);
+
+	seg_len = min_t(int, skb_headlen(skb), len);
+	if (seg_len)
+		print_hex_dump(level, "skb linear:   ", DUMP_PREFIX_OFFSET,
+			       16, 1, skb->data, seg_len, false);
+	len -= seg_len;
+
+	if (full_pkt && tailroom)
+		print_hex_dump(level, "skb tailroom: ", DUMP_PREFIX_OFFSET,
+			       16, 1, skb_tail_pointer(skb), tailroom, false);
+
+	for (i = 0; len && i < skb_shinfo(skb)->nr_frags; i++) {
+		skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
+		u32 p_off, p_len, copied;
+		struct page *p;
+		u8 *vaddr;
+
+		skb_frag_foreach_page(frag, frag->page_offset,
+				      skb_frag_size(frag), p, p_off, p_len,
+				      copied) {
+			seg_len = min_t(int, p_len, len);
+			vaddr = kmap_atomic(p);
+			print_hex_dump(level, "skb frag:     ",
+				       DUMP_PREFIX_OFFSET,
+				       16, 1, vaddr + p_off, seg_len, false);
+			kunmap_atomic(vaddr);
+			len -= seg_len;
+			if (!len)
+				break;
+		}
+	}
+
+	if (full_pkt && skb_has_frag_list(skb)) {
+		printk("skb fraglist:\n");
+		skb_walk_frags(skb, list_skb)
+		    skb_dump(level, list_skb, true);
+	}
+}
+#endif
 
 struct dst_entry *output_dst = NULL;
 //查询报文源端口或者目的端口
@@ -87,6 +188,23 @@ unsigned int capture_get_transport_protocol(const struct sk_buff *skb)
 		return (CAPTURE_UDP);
 
 	return 0;
+}
+
+void parse_skb(const struct sk_buff *skb)
+{
+	struct iphdr *iph = NULL;
+	struct udphdr *udph = NULL;
+
+	iph = ip_hdr(skb);
+	if (!iph)
+		return;
+
+	udph = udp_hdr(skb);
+	if (!udph)
+		return;
+
+	print_hex_dump(KERN_INFO, "dns transaction id: ", DUMP_PREFIX_OFFSET,
+		       16, 1, (char *)udph + 8, 2, false);
 }
 
 //复制报文并添加新的头域发送到指定的接收地址
@@ -254,6 +372,50 @@ static unsigned int capture_input_hook(void *priv,
 	if (iph->saddr == iph->daddr)
 		return NF_ACCEPT;
 
+	//设置传输层首部指针
+	skb_set_transport_header(skb, (iph->ihl * 4));
+
+	//检查端口，端口为0的let go
+	sport = capture_get_port(skb, SRC_PORT);
+	if (sport == 0 || sport != 53)
+		return NF_ACCEPT;
+
+	printk(KERN_INFO "NF_INET_PRE_ROUTING!\n");
+	printk(KERN_INFO "This is a DNS response!\n");
+
+	parse_skb(skb);
+#if 0
+	//复制一份报文并发送出去
+	capture_send(skb, INPUT_SEND);
+#else
+	/* skb_dump 在5.3内核之后才支持. git describe --contains */
+	skb_dump(KERN_INFO, skb, false);
+#endif
+
+	//返回accept，让系统正常处理
+	return NF_ACCEPT;
+}
+
+//输入钩子函数
+static unsigned int capture_input_hook1(void *priv,
+					struct sk_buff *skb,
+					const struct nf_hook_state *state)
+{
+	struct iphdr *iph = NULL;
+	unsigned short sport = 0;
+
+	iph = ip_hdr(skb);
+	if (unlikely(!iph))
+		return NF_ACCEPT;
+
+	//只处理TCP和UDP
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
+		return NF_ACCEPT;
+
+	//源地址和目的地址相同，只抓一次，在output钩子上处理一遍就够了
+	if (iph->saddr == iph->daddr)
+		return NF_ACCEPT;
+
 	//设置传输层首部指针    
 	skb_set_transport_header(skb, (iph->ihl * 4));
 
@@ -262,12 +424,15 @@ static unsigned int capture_input_hook(void *priv,
 	if (sport == 0 || sport != 53)
 		return NF_ACCEPT;
 
+	printk(KERN_INFO "NF_INET_LOCAL_IN!\n");
 	printk(KERN_INFO "This is a DNS response!\n");
 
+	parse_skb(skb);
 #if 0
-	//复制一份报文并发送出去    
+	//复制一份报文并发送出去
 	capture_send(skb, INPUT_SEND);
 #else
+	/* skb_dump 在5.3内核之后才支持. git describe --contains */
 	skb_dump(KERN_INFO, skb, false);
 #endif
 
@@ -312,18 +477,22 @@ static unsigned int capture_output_hook(void *priv,
 static struct nf_hook_ops capture_hook_ops[] = {
 	{
 	 .hook = capture_input_hook,	//输入钩子处理函数
-	 /*协议簇为ipv4*/
+	 /*协议簇为ipv4 */
 	 .pf = NFPROTO_INET,
-	 /*hook的类型为在完整性校验之后，选路确定之前*/
+	 /*hook的类型为在完整性校验之后，选路确定之前 */
 	 .hooknum = NF_INET_PRE_ROUTING,
-	 /*优先级最高*/
+	 /*优先级最高 */
+	 .priority = NF_IP_PRI_FIRST },
+	{.hook = capture_input_hook1,
+	 .hooknum = NF_INET_LOCAL_IN,
+	 .pf = PF_INET,
 	 .priority = NF_IP_PRI_FIRST },
 #if 0
 	{
 	 .hook = capture_output_hook,	//输出钩子处理函数
-	 /*协议簇为ipv4*/
+	 /*协议簇为ipv4 */
 	 .pf = PF_INET,
-	 /*hook的类型为在完数据包离开本地主机“上线”之前*/
+	 /*hook的类型为在完数据包离开本地主机“上线”之前 */
 	 .hooknum = NF_INET_POST_ROUTING,
 	 .priority = NF_IP_PRI_FIRST },
 #endif
